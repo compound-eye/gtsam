@@ -202,6 +202,9 @@ Ordering Ordering::ColamdConstrained(const VariableIndex& variableIndex,
   typedef FastMap<Key, int>::value_type key_group;
   for(const key_group& p: groups) {
     // FIXME: check that no groups are skipped
+    if (!keyIndices.exists(p.first)) {
+      std::cerr << "Key not found: " << gtsam::Symbol(p.first) << std::endl;
+    }
     cmember[keyIndices.at(p.first)] = p.second;
   }
 

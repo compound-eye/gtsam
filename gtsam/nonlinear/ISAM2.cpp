@@ -485,8 +485,31 @@ void ISAM2::marginalizeLeaves(
 
   // Keep track of marginal factors - map from clique to the marginal factors
   // that should be incorporated into it, passed up from it's children.
-  //  multimap<sharedClique, GaussianFactor::shared_ptr> marginalFactors;
-  map<Key, vector<GaussianFactor::shared_ptr> > marginalFactors;
+  // There are two types of marginal factors:
+  //   - Marginal factors not involving any of the marginalized variables. These
+  //     factors will be incorporated into respective cliques after
+  //     marginalization process is complete.
+  //   - Magrinal factors that involve some marginalized variables. These
+  //     factors will be consumed when the parent clique is itself marginalized.
+  map<Key, vector<GaussianFactor::shared_ptr> > marginalFactorsToKeep;
+  map<Key, vector<GaussianFactor::shared_ptr> > temporaryMarginalFactors;
+
+  auto add_marginal_factor = [&](Key key,
+                                 const GaussianFactor::shared_ptr& factor) {
+    bool is_temporary = false;
+    for (Key key : *factor) {
+      if (leafKeys.exists(key)) {
+        is_temporary = true;
+        break;
+      }
+    }
+
+    if (is_temporary) {
+      temporaryMarginalFactors[key].push_back(factor);
+    } else {
+      marginalFactorsToKeep[key].push_back(factor);
+    }
+  };
 
   // Keep track of variables removed in subtrees
   KeySet leafKeysRemoved;
@@ -499,7 +522,8 @@ void ISAM2::marginalizeLeaves(
     const Cliques removedCliques = this->removeSubtree(subtreeRoot);
     for (const sharedClique& removedClique : removedCliques) {
       auto cg = removedClique->conditional();
-      marginalFactors.erase(cg->front());
+      marginalFactorsToKeep.erase(cg->front());
+      temporaryMarginalFactors.erase(cg->front());
       leafKeysRemoved.insert(cg->beginFrontals(), cg->endFrontals());
       for (Key frontal : cg->frontals()) {
         // Add to factors to remove
@@ -523,17 +547,7 @@ void ISAM2::marginalizeLeaves(
     if (!leafKeysRemoved.exists(j)) {  // If the index was not already removed
                                        // by removing another subtree
 
-      // Traverse up the tree to find the root of the marginalized subtree
       sharedClique clique = nodes_[j];
-      while (!clique->parent_._empty()) {
-        // Check if parent contains a marginalized leaf variable.  Only need to
-        // check the first variable because it is the closest to the leaves.
-        sharedClique parent = clique->parent();
-        if (leafKeys.exists(parent->conditional()->front()))
-          clique = parent;
-        else
-          break;
-      }
 
       // See if we should remove the whole clique
       bool marginalizeEntireClique = true;
@@ -553,8 +567,8 @@ void ISAM2::marginalizeLeaves(
         // because their information is already incorporated in the new
         // marginal factor.  So, now associate this marginal factor with the
         // parent of this clique.
-        marginalFactors[clique->parent()->conditional()->front()].push_back(
-            marginalFactor);
+        add_marginal_factor(clique->parent()->conditional()->front(),
+                            marginalFactor);
         // Now remove this clique and its subtree - all of its marginal
         // information has been stored in marginalFactors.
         trackingRemoveSubtree(clique);
@@ -571,11 +585,10 @@ void ISAM2::marginalizeLeaves(
         Cliques subtreesToRemove;
         for (const sharedClique& child : clique->children) {
           // Remove subtree if child depends on any marginalized keys
+          // TODO(konstantin): This cannot happen!
           for (Key parent : child->conditional()->parents()) {
             if (leafKeys.exists(parent)) {
-              subtreesToRemove.push_back(child);
-              graph.push_back(child->cachedFactor());  // Add child marginal
-              break;
+              abort();
             }
           }
         }
@@ -593,9 +606,13 @@ void ISAM2::marginalizeLeaves(
         // TODO(dellaert): reuse cached linear factors
         KeySet factorsFromMarginalizedInClique_step1;
         for (Key frontal : clique->conditional()->frontals()) {
-          if (leafKeys.exists(frontal))
-            factorsFromMarginalizedInClique_step1.insert(
-                variableIndex_[frontal].begin(), variableIndex_[frontal].end());
+          if (leafKeys.exists(frontal)) {
+            for (auto& affectedFactor : variableIndex_[frontal]) {
+              if (!factorIndicesToRemove.exists(affectedFactor)) {
+                factorsFromMarginalizedInClique_step1.insert(affectedFactor);
+              }
+            }
+          }
         }
         // Remove any factors in subtrees that we're removing at this step
         for (const sharedClique& removedChild : childrenRemoved) {
@@ -610,9 +627,18 @@ void ISAM2::marginalizeLeaves(
           graph.push_back(nonlinearFactors_[index]->linearize(theta_));
         }
 
+        auto cg = clique->conditional();
+
+        for (const auto& f : temporaryMarginalFactors[cg->front()]) {
+          graph.push_back(f);
+        }
+        temporaryMarginalFactors.erase(cg->front());
+
+        // Handle marginal factors passed up from children. Only take factors
+        // involving variables being marginalized.
+
         // Reeliminate the linear graph to get the marginal and discard the
         // conditional
-        auto cg = clique->conditional();
         const KeySet cliqueFrontals(cg->beginFrontals(), cg->endFrontals());
         KeyVector cliqueFrontalsToEliminate;
         std::set_intersection(cliqueFrontals.begin(), cliqueFrontals.end(),
@@ -622,8 +648,9 @@ void ISAM2::marginalizeLeaves(
             graph, Ordering(cliqueFrontalsToEliminate));
 
         // Add the resulting marginal
-        if (eliminationResult1.second)
-          marginalFactors[cg->front()].push_back(eliminationResult1.second);
+        if (eliminationResult1.second) {
+          add_marginal_factor(cg->front(), eliminationResult1.second);
+        }
 
         // Split the current clique
         // Find the position of the last leaf key in this clique
@@ -657,10 +684,15 @@ void ISAM2::marginalizeLeaves(
 
   // At this point we have updated the BayesTree, now update the remaining iSAM2
   // data structures
+  //
+  if (!temporaryMarginalFactors.empty()) {
+    std::cout << "Not empty temporary factors" << std::endl;
+    abort();
+  }
 
   // Gather factors to add - the new marginal factors
   GaussianFactorGraph factorsToAdd;
-  for (const auto& key_factors : marginalFactors) {
+  for (const auto& key_factors : marginalFactorsToKeep) {
     for (const auto& factor : key_factors.second) {
       if (factor) {
         factorsToAdd.push_back(factor);

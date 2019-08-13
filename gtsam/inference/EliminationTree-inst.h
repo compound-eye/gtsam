@@ -66,7 +66,7 @@ namespace gtsam {
     std::cout << str << "(" << keyFormatter(key) << ")\n";
     for(const sharedFactor& factor: factors) {
       if(factor)
-        factor->print(str);
+        factor->print(str + " factor");
       else
         std::cout << str << "null factor\n";
     }
